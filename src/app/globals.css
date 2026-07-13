@@ -1,0 +1,215 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+/**
+ * Nebkern design tokens.
+ *
+ * Dark is the primary theme — this is an operator tool people stare at while a
+ * migration runs — but light is fully supported rather than an afterthought.
+ * The `dark` variant keys off a class on <html> so the toggle is instant and does
+ * not depend on the OS setting.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --color-brand-100: oklch(0.93 0.04 265);
+  --color-brand-300: oklch(0.78 0.11 265);
+  --color-brand-400: oklch(0.71 0.15 265);
+  --color-brand-500: oklch(0.63 0.19 265);
+  --color-brand-600: oklch(0.55 0.21 265);
+  --color-brand-700: oklch(0.47 0.19 265);
+
+  --color-accent-400: oklch(0.78 0.16 168);
+  --color-accent-500: oklch(0.7 0.16 168);
+  --color-accent-600: oklch(0.6 0.14 168);
+
+  --radius-glass: 1rem;
+}
+
+/* Semantic tokens, resolved per theme. */
+:root {
+  --bg: oklch(0.98 0.004 265);
+  --bg-wash-a: oklch(0.93 0.035 265);
+  --bg-wash-b: oklch(0.94 0.03 200);
+  --fg: oklch(0.21 0.02 265);
+  --fg-muted: oklch(0.5 0.02 265);
+  --fg-subtle: oklch(0.62 0.015 265);
+
+  --glass-bg: oklch(1 0 0 / 0.72);
+  --glass-border: oklch(0.55 0.02 265 / 0.14);
+  --glass-hover: oklch(1 0 0 / 0.9);
+
+  --line: oklch(0.55 0.02 265 / 0.14);
+  --input-bg: oklch(1 0 0 / 0.7);
+
+  --ok: oklch(0.6 0.15 155);
+  --warn: oklch(0.68 0.16 70);
+  --danger: oklch(0.58 0.21 25);
+  --info: oklch(0.63 0.19 265);
+}
+
+.dark {
+  --bg: oklch(0.15 0.015 265);
+  --bg-wash-a: oklch(0.26 0.07 275);
+  --bg-wash-b: oklch(0.21 0.05 200);
+  --fg: oklch(0.96 0.005 265);
+  --fg-muted: oklch(0.68 0.02 265);
+  --fg-subtle: oklch(0.55 0.02 265);
+
+  --glass-bg: oklch(0.24 0.02 265 / 0.55);
+  --glass-border: oklch(1 0 0 / 0.09);
+  --glass-hover: oklch(0.29 0.022 265 / 0.72);
+
+  --line: oklch(1 0 0 / 0.09);
+  --input-bg: oklch(0.18 0.018 265 / 0.7);
+
+  --ok: oklch(0.74 0.16 158);
+  --warn: oklch(0.8 0.15 78);
+  --danger: oklch(0.68 0.19 22);
+  --info: oklch(0.72 0.15 265);
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    min-height: 100dvh;
+    background-color: var(--bg);
+    color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /**
+   * The ambient background: two large, soft radial washes rather than a flat fill.
+   * This is what the glass panels actually refract — with a flat background,
+   * backdrop-blur has nothing interesting to blur and the whole material reads as
+   * a plain translucent rectangle.
+   */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(72rem 42rem at 10% -10%, var(--bg-wash-a), transparent 60%),
+      radial-gradient(60rem 36rem at 95% 4%, var(--bg-wash-b), transparent 62%);
+  }
+
+  ::selection {
+    background: var(--color-brand-500);
+    color: white;
+  }
+}
+
+@layer components {
+  .glass {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-glass);
+    backdrop-filter: blur(20px) saturate(1.4);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
+    box-shadow: 0 8px 32px -12px oklch(0 0 0 / 0.35);
+  }
+
+  .glass-hover {
+    transition:
+      background-color 180ms ease,
+      border-color 180ms ease,
+      transform 180ms ease;
+  }
+  .glass-hover:hover {
+    background: var(--glass-hover);
+    border-color: oklch(0.63 0.19 265 / 0.35);
+  }
+
+  /* A hairline highlight along the top edge, the way real glass catches light.
+     Cheap to render, and it is most of what sells the material. */
+  .glass-sheen {
+    position: relative;
+  }
+  .glass-sheen::after {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    border-radius: inherit;
+    background: linear-gradient(90deg, transparent, oklch(1 0 0 / 0.22), transparent);
+  }
+}
+
+@layer utilities {
+  /* Numbers that change every frame (row counts, byte totals, ETAs) must not make
+     the layout jitter. Tabular figures keep every digit the same width. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* An indeterminate shimmer, for bars whose total we do not yet know. */
+  @keyframes nebkern-shimmer {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(320%);
+    }
+  }
+  .animate-shimmer {
+    animation: nebkern-shimmer 1.6s ease-in-out infinite;
+  }
+
+  @keyframes nebkern-ping-ring {
+    0% {
+      box-shadow: 0 0 0 0 oklch(0.7 0.16 168 / 0.5);
+    }
+    70% {
+      box-shadow: 0 0 0 7px oklch(0.7 0.16 168 / 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 oklch(0.7 0.16 168 / 0);
+    }
+  }
+  .animate-ping-ring {
+    animation: nebkern-ping-ring 2s ease-out infinite;
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border-radius: 999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* The shimmer and the ping both carry meaning (work is in progress), so under
+   reduced-motion they collapse to static rather than vanishing entirely. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
