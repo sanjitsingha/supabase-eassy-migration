@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Nebkern runtime state: migration job documents, checkpoints and NDJSON logs.
+# Machine-local and per-run — it describes migrations *this* install performed, not the
+# application. It also carries the endpoint URLs and project refs of whatever real
+# projects were migrated, which do not belong in a shared repository. Credentials are
+# never written here by design (they live only in the in-memory vault), but the run
+# history still should not be published.
+.nebkern/

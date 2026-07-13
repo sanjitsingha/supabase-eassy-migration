@@ -13,7 +13,8 @@
     "verify:connection": "tsx scripts/verify-connection.ts",
     "verify:database": "tsx scripts/verify-database-test.ts",
     "verify:store-fallback": "tsx scripts/verify-store-fallback.ts",
-    "verify": "npm run typecheck && npm run verify:migration && npm run verify:resume && npm run verify:connection && npm run verify:database && npm run verify:store-fallback",
+    "verify:rpc": "tsx scripts/verify-rpc-helper.ts",
+    "verify": "npm run typecheck && npm run verify:migration && npm run verify:resume && npm run verify:connection && npm run verify:database && npm run verify:store-fallback && npm run verify:rpc",
     "check": "npm run lint && npm run verify && npm run build"
   },
   "dependencies": {

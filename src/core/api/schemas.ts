@@ -13,7 +13,7 @@ import { MigrationError, toMigrationError } from '@/core/domain/errors';
 import { DEFAULTS } from '@/core/domain/constants';
 
 export const databaseConnectionSchema = z.object({
-  mode: z.enum(['connection_string', 'manual']),
+  mode: z.enum(['rpc', 'connection_string', 'manual']),
   connectionString: z.string().optional(),
   host: z.string().optional(),
   port: z.number().int().min(1).max(65535).optional(),
@@ -106,11 +106,15 @@ export type CredentialsInput = z.infer<typeof credentialsSchema>;
 export function toCredentials(input: CredentialsInput): SupabaseCredentials {
   const db = input.database;
 
+  // RPC mode needs no target at all — it authenticates with the service role key over
+  // the API URL we already have. It is "configured" by virtue of being selected.
   const hasTarget =
     db !== undefined &&
-    (db.mode === 'connection_string'
-      ? (db.connectionString ?? '').trim() !== ''
-      : (db.host ?? '').trim() !== '');
+    (db.mode === 'rpc'
+      ? true
+      : db.mode === 'connection_string'
+        ? (db.connectionString ?? '').trim() !== ''
+        : (db.host ?? '').trim() !== '');
 
   return {
     type: input.type,

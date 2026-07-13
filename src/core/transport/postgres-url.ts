@@ -16,7 +16,7 @@
  * interpretation that cannot be ambiguous.
  */
 
-import type { DatabaseConnection, PoolerMode, ResolvedConnection, SslMode } from '@/core/domain/types';
+import type { ConnectionMode, DatabaseConnection, PoolerMode, ResolvedConnection, SslMode } from '@/core/domain/types';
 
 export interface ParsedConnectionString {
   readonly ok: boolean;
@@ -193,8 +193,17 @@ function safeDecode(value: string): string {
 // Resolution
 // ---------------------------------------------------------------------------
 
-/** Flattens either connection mode into the concrete values we will dial. */
+/**
+ * Flattens a connection into the concrete values we will dial.
+ *
+ * Returns null for `rpc`, which is correct rather than a gap: RPC mode has no socket to
+ * dial. `buildPostgresConfig` therefore yields no Postgres config, the direct transport
+ * reports itself unavailable, and the factory falls through to the RPC transport — which
+ * is exactly the intended outcome.
+ */
 export function resolveConnection(connection: DatabaseConnection): ResolvedConnection | null {
+  if (connection.mode === 'rpc') return null;
+
   if (connection.mode === 'connection_string') {
     const raw = connection.connectionString ?? '';
     if (raw.trim() === '') return null;
@@ -225,8 +234,10 @@ export function resolveConnection(connection: DatabaseConnection): ResolvedConne
   };
 }
 
-/** The password, from whichever mode is active. */
+/** The password, from whichever mode is active. RPC has none — it authenticates with the service role key. */
 export function resolvePassword(connection: DatabaseConnection): string {
+  if (connection.mode === 'rpc') return '';
+
   if (connection.mode === 'connection_string') {
     const parsed = parseConnectionString(connection.connectionString ?? '');
     return parsed.ok ? parsed.password : '';
@@ -283,7 +294,7 @@ export const CONNECTION_DEFAULTS = {
 } as const;
 
 /** A blank connection with Postgres's own defaults already filled in. */
-export function emptyConnection(mode: 'connection_string' | 'manual' = 'connection_string'): DatabaseConnection {
+export function emptyConnection(mode: ConnectionMode = 'connection_string'): DatabaseConnection {
   return {
     mode,
     connectionString: '',

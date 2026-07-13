@@ -15,8 +15,23 @@ export type InstanceType = 'cloud' | 'self_hosted';
 
 export type EndpointRole = 'source' | 'destination';
 
-/** How the user chose to describe the Postgres connection. */
-export type ConnectionMode = 'connection_string' | 'manual';
+/**
+ * How the tool gets a SQL channel to this endpoint.
+ *
+ * `rpc` is the odd one out and deserves the explanation: it is not a Postgres
+ * connection at all. It runs SQL through a `security definer` helper function exposed
+ * over PostgREST — i.e. over the Supabase API that is *already* reachable, since that
+ * is the entire purpose of an API gateway.
+ *
+ * That matters enormously for self-hosting. On a real Docker Compose, Coolify or
+ * Kubernetes deployment, Postgres is deliberately bound to the internal network and
+ * port 5432 is not reachable from outside. The direct-connection modes below therefore
+ * fail with `ECONNREFUSED` through no fault of the user's, and the only ways forward
+ * would be to expose a database port to the internet (a bad trade) or to co-locate this
+ * tool inside their network (often impractical). `rpc` sidesteps both: if the API works,
+ * SQL works.
+ */
+export type ConnectionMode = 'rpc' | 'connection_string' | 'manual';
 
 /**
  * TLS policy for the Postgres socket.

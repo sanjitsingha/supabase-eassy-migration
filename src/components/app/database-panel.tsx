@@ -18,7 +18,9 @@
 import * as React from 'react';
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
+  Copy,
   Database,
   Eye,
   EyeOff,
@@ -31,6 +33,9 @@ import {
 } from 'lucide-react';
 import type { DatabaseConnection, DatabaseTestResult, PoolerMode, SslMode } from '@/core/domain/types';
 import { parseConnectionString, buildConnectionString, CONNECTION_DEFAULTS } from '@/core/transport/postgres-url';
+// Safe to import into a client component: `exec-helper` is a plain string module and
+// pulls in no Postgres driver.
+import { EXEC_HELPER_SQL } from '@/core/transport/exec-helper';
 import { cn, formatNumber } from '@/lib/utils';
 import {
   Badge,
@@ -128,16 +133,18 @@ export function DatabasePanel({
       : null;
 
   const canTest =
-    value.mode === 'connection_string'
-      ? parsed?.ok === true
-      : (value.host ?? '').trim() !== '';
+    value.mode === 'rpc'
+      ? true // Nothing to fill in — it uses the API URL and key from the section above.
+      : value.mode === 'connection_string'
+        ? parsed?.ok === true
+        : (value.host ?? '').trim() !== '';
 
   return (
     <Collapsible
       title="Database Connection"
       description={
         required
-          ? 'Required — self-hosted Supabase has no Management API, so this is the only way to read the schema.'
+          ? 'Required — self-hosted Supabase has no Management API, so the tool needs its own way to run SQL.'
           : 'Optional on Cloud when a Personal Access Token is supplied.'
       }
       icon={Database}
@@ -165,32 +172,54 @@ export function DatabasePanel({
         <RadioGroup
           value={value.mode}
           onValueChange={(mode) => update({ mode: mode as DatabaseConnection['mode'] })}
-          className="grid grid-cols-2 gap-2"
+          className="grid gap-2"
         >
           {(
             [
-              ['connection_string', 'Connection String'],
-              ['manual', 'Manual'],
+              [
+                'rpc',
+                'SQL Helper (over your API)',
+                'Easiest — no database port needed. Runs SQL through the Supabase API you already connected.',
+              ],
+              [
+                'connection_string',
+                'Connection String',
+                'Direct Postgres. Needs port 5432 reachable from this machine.',
+              ],
+              ['manual', 'Manual', 'Direct Postgres, entered field by field.'],
             ] as const
-          ).map(([mode, label]) => (
+          ).map(([mode, label, description]) => (
             <label
               key={mode}
               className={cn(
-                'flex cursor-pointer items-center gap-2.5 rounded-lg border p-2.5 text-sm transition-colors',
+                'flex cursor-pointer items-start gap-2.5 rounded-lg border p-2.5 text-sm transition-colors',
                 value.mode === mode
                   ? 'border-[var(--color-brand-500)]/50 bg-[var(--color-brand-500)]/8'
                   : 'border-[var(--line)] hover:border-[var(--color-brand-500)]/30',
               )}
             >
-              <RadioGroupItem value={mode} id={`${id}-mode-${mode}`} />
-              {label}
+              <RadioGroupItem value={mode} id={`${id}-mode-${mode}`} className="mt-0.5" />
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  {label}
+                  {mode === 'rpc' && (
+                    <Badge tone="ok" className="text-[10px]">
+                      recommended
+                    </Badge>
+                  )}
+                </div>
+                <p className="mt-0.5 text-xs leading-relaxed text-[var(--fg-subtle)]">{description}</p>
+              </div>
             </label>
           ))}
         </RadioGroup>
       </div>
 
-      {/* Connection string ------------------------------------------------ */}
-      {value.mode === 'connection_string' ? (
+      {/* SQL helper ------------------------------------------------------- */}
+      {value.mode === 'rpc' ? (
+        <RpcSetup id={id} result={result} />
+      ) : /* Connection string ---------------------------------------------- */
+      value.mode === 'connection_string' ? (
         <div className="space-y-3">
           <Field
             label="Postgres Connection String"
@@ -318,7 +347,11 @@ export function DatabasePanel({
         </div>
       )}
 
-      {/* Advanced --------------------------------------------------------- */}
+      {/* Advanced ---------------------------------------------------------
+          Omitted entirely in RPC mode: SSL, pooler mode and connection timeout all
+          describe a Postgres socket, and RPC never opens one. Showing them greyed out
+          would still imply they do something. */}
+      {value.mode !== 'rpc' && (
       <Collapsible
         title="Advanced"
         description="SSL, pooler mode, connection timeout"
@@ -369,12 +402,13 @@ export function DatabasePanel({
           />
         </Field>
       </Collapsible>
+      )}
 
       {/* Test ------------------------------------------------------------- */}
       <div className="flex items-center gap-2">
         <Button variant="outline" onClick={onTest} disabled={!canTest} loading={testing}>
           <Plug />
-          Test PostgreSQL
+          {value.mode === 'rpc' ? 'Test SQL Helper' : 'Test PostgreSQL'}
         </Button>
         {!canTest && (
           <span className="text-xs text-[var(--fg-subtle)]">
@@ -395,6 +429,93 @@ function ParsedField({ label, value }: { label: string; value: string }): React.
       <dd className="truncate font-mono text-[var(--fg)]" title={value}>
         {value}
       </dd>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SQL helper setup
+// ---------------------------------------------------------------------------
+
+/**
+ * The one-time setup for the RPC channel.
+ *
+ * There is nothing for the user to *fill in* here — it reuses the API URL and service
+ * role key from the section above. The only step is running the SQL once, so the panel
+ * is deliberately just: copy this, paste it in Studio, press Test.
+ */
+function RpcSetup({ id, result }: { id: string; result: DatabaseTestResult | null }): React.JSX.Element {
+  const [copied, setCopied] = React.useState(false);
+  const installed = result?.ok === true;
+
+  const copy = async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(EXEC_HELPER_SQL);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard blocked (insecure origin, or a permissions policy). The SQL is
+      // visible and selectable below, so this is a downgrade, not a dead end.
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-lg border border-[var(--color-brand-500)]/30 bg-[var(--color-brand-500)]/8 p-3">
+        <div className="flex gap-2.5">
+          <Info className="mt-0.5 size-4 shrink-0 text-[var(--info)]" />
+          <div className="space-y-1 text-xs leading-relaxed">
+            <p className="font-medium text-[var(--fg)]">No database port required.</p>
+            <p className="text-[var(--fg-muted)]">
+              This runs SQL through the Supabase API you already connected above, so Postgres can stay
+              on your private network. Most self-hosted stacks (Docker Compose, Coolify, Kubernetes)
+              never expose port 5432 — this is the path of least resistance for them.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor={`${id}-helper-sql`}>One-time setup</Label>
+            {installed && (
+              <Badge tone="ok" className="text-[10px]">
+                <CheckCircle2 className="size-2.5" />
+                installed
+              </Badge>
+            )}
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => void copy()}>
+            {copied ? <Check /> : <Copy />}
+            {copied ? 'Copied' : 'Copy SQL'}
+          </Button>
+        </div>
+
+        <p className="mb-2 text-xs leading-relaxed text-[var(--fg-subtle)]">
+          Run this once in your Supabase <strong>SQL Editor</strong> (Studio → SQL Editor → New query),
+          then press <strong>Test SQL Helper</strong> below.
+        </p>
+
+        <pre
+          id={`${id}-helper-sql`}
+          className="scrollbar-thin max-h-48 overflow-auto rounded-lg border border-[var(--line)] bg-[var(--glass-bg)] p-3 font-mono text-[11px] leading-relaxed text-[var(--fg-muted)]"
+        >
+          {EXEC_HELPER_SQL}
+        </pre>
+      </div>
+
+      {/* Stated up front rather than buried, because it is a real trade-off the user is
+          entitled to weigh before pasting a security-definer function into their DB. */}
+      <div className="flex gap-2 rounded-lg border border-[var(--line)] bg-[var(--input-bg)] p-3 text-xs leading-relaxed text-[var(--fg-subtle)]">
+        <ShieldCheck className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          These functions are granted to the <code className="font-mono">service_role</code> only —
+          never to <code className="font-mono">anon</code> — so they add no access that your service
+          role key did not already have. Drop them when the migration is done; the Settings page has
+          the SQL.
+        </span>
+      </div>
     </div>
   );
 }

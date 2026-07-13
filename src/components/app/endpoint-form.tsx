@@ -70,22 +70,35 @@ export interface EndpointState {
   database: DatabaseConnection;
 }
 
+/**
+ * A blank endpoint.
+ *
+ * Self-hosted defaults to the RPC (SQL helper) channel rather than a direct Postgres
+ * connection. That is the pragmatic default, not the "advanced" one: on a real
+ * self-hosted stack — Docker Compose, Coolify, Kubernetes — Postgres is bound to the
+ * internal network and port 5432 simply is not reachable from wherever this tool runs.
+ * Defaulting to a direct connection sends users down a dead end that ends in
+ * `ECONNREFUSED` and a choice between exposing a database to the internet or giving up.
+ */
 export function emptyEndpoint(type: InstanceType = 'cloud'): EndpointState {
   return {
     type,
     url: '',
     serviceRoleKey: '',
     accessToken: '',
-    database: emptyConnection('connection_string'),
+    database: emptyConnection(type === 'self_hosted' ? 'rpc' : 'connection_string'),
   };
 }
 
 /** Form state → the credentials the API expects. */
 export function toCredentials(state: EndpointState): SupabaseCredentials {
+  // RPC needs no target of its own: it rides the API URL and service role key above.
   const hasTarget =
-    state.database.mode === 'connection_string'
-      ? (state.database.connectionString ?? '').trim() !== ''
-      : (state.database.host ?? '').trim() !== '';
+    state.database.mode === 'rpc'
+      ? true
+      : state.database.mode === 'connection_string'
+        ? (state.database.connectionString ?? '').trim() !== ''
+        : (state.database.host ?? '').trim() !== '';
 
   return {
     type: state.type,
@@ -96,7 +109,16 @@ export function toCredentials(state: EndpointState): SupabaseCredentials {
   };
 }
 
-/** True when this endpoint is ready to migrate — API reachable, and a usable SQL channel. */
+/**
+ * True when this endpoint is ready to migrate — API reachable, and a usable SQL channel.
+ *
+ * "A usable SQL channel" is the key phrase, and it is deliberately agnostic about which
+ * one. Self-hosted has no Management API, so it needs *either* a direct Postgres
+ * connection *or* the RPC helper — and both arrive here as a passing `dbResult`, because
+ * both answer the same question. An earlier version of this gated self-hosted on a
+ * direct Postgres connection specifically, which silently made the RPC path unreachable
+ * even though the engine supported it.
+ */
 export function isEndpointReady(
   state: EndpointState,
   apiResult: ApiTestResult | null,
@@ -104,10 +126,10 @@ export function isEndpointReady(
 ): boolean {
   if (apiResult?.ok !== true) return false;
 
-  // Self-hosted has no Management API, so Postgres is the only SQL channel there is.
+  // Self-hosted: any working SQL channel will do — direct Postgres or the RPC helper.
   if (state.type === 'self_hosted') return dbResult?.ok === true;
 
-  // Cloud can go through the Management API with a PAT, or through Postgres.
+  // Cloud can additionally go through the Management API with a PAT.
   return state.accessToken.trim() !== '' || dbResult?.ok === true;
 }
 
@@ -152,12 +174,26 @@ export function EndpointForm({
   const urlValid = React.useMemo(() => isValidUrl(value.url), [value.url]);
 
   const set = <K extends keyof EndpointState>(key: K, next: EndpointState[K]): void => {
-    const updated = { ...value, [key]: next };
+    let updated = { ...value, [key]: next };
 
-    // Switching instance type changes what is required, so open the database panel
-    // when it becomes mandatory.
     if (key === 'type') {
-      setDbOpen(next === 'self_hosted');
+      const nowSelfHosted = next === 'self_hosted';
+      // Open the database panel when it becomes mandatory.
+      setDbOpen(nowSelfHosted);
+
+      // Re-pick the default SQL channel for the new instance type, but only while the
+      // user has not configured one themselves — switching the radio must not silently
+      // discard a connection string they already pasted.
+      const untouched =
+        (value.database.connectionString ?? '').trim() === '' && (value.database.host ?? '').trim() === '';
+
+      if (untouched) {
+        updated = {
+          ...updated,
+          database: emptyConnection(nowSelfHosted ? 'rpc' : 'connection_string'),
+        };
+      }
+      onDbResult(null);
     }
 
     onChange(updated);
@@ -182,12 +218,16 @@ export function EndpointForm({
       const result = await api.testApi(toCredentials(value));
       onApiResult(result);
 
-      // Auto-detection. Once the API answers we know a hostname that is at least
-      // plausible for Postgres too — right for a plain Docker Compose box where Kong
-      // and the database share a machine. When it is wrong (behind a proxy, on
-      // Coolify, on Kubernetes) the user overrides it, but the common case costs them
-      // nothing. Only ever a suggestion into an empty field; never an overwrite.
-      if (result.ok && selfHosted) {
+      // Auto-detection, for the direct-Postgres modes only. Once the API answers we know
+      // a hostname that is at least plausible for Postgres too — right for a plain Docker
+      // Compose box where Kong and the database share a machine. Only ever a suggestion
+      // into an empty field, never an overwrite.
+      //
+      // Deliberately does NOT fire in RPC mode: that mode needs no host at all, and
+      // silently populating one (or switching the mode to `manual` to hold it) would drag
+      // the user back onto the direct-connection path they had just been steered away
+      // from — which on most self-hosted stacks dead-ends at ECONNREFUSED.
+      if (result.ok && selfHosted && value.database.mode !== 'rpc') {
         const host = hostFromUrl(value.url);
         const untouched =
           (value.database.connectionString ?? '').trim() === '' && (value.database.host ?? '').trim() === '';

@@ -22,6 +22,7 @@ import { EXEC_SQL_FUNCTION, DEFAULTS } from '@/core/domain/constants';
 import { httpRequest, normaliseUrl, parseProjectRef, serviceHeaders } from '@/core/transport/http';
 import { inlineParams } from '@/core/transport/sql';
 import { isSessionless, resolveConnection, resolvePassword } from '@/core/transport/postgres-url';
+import { EXEC_HELPER_SQL, DROP_EXEC_HELPER_SQL } from '@/core/transport/exec-helper';
 
 const MANAGEMENT_API = 'https://api.supabase.com';
 
@@ -110,7 +111,19 @@ class RpcTransport implements SqlTransport {
     private readonly serviceRoleKey: string,
   ) {}
 
-  private async call<T>(fn: string, body: Record<string, unknown>): Promise<T> {
+  /**
+   * Calls an RPC and returns the raw response body as text.
+   *
+   * Text, not `.json()`, and that distinction is load-bearing. `nebkern_exec_sql_ddl`
+   * returns `void`, so PostgREST answers **204 No Content with an empty body**. Calling
+   * `.json()` on an empty body throws `Unexpected end of JSON input` — and because the
+   * statement has *already executed server-side* by then, the throw would report every
+   * successfully-applied DDL statement as a failure. A whole migration would look
+   * catastrophically broken while actually having worked.
+   *
+   * So the body is read as text and parsed only by callers that expect one.
+   */
+  private async call(fn: string, body: Record<string, unknown>): Promise<string> {
     const response = await httpRequest({
       method: 'POST',
       url: `${this.url}/rest/v1/rpc/${fn}`,
@@ -119,17 +132,30 @@ class RpcTransport implements SqlTransport {
       context: `RPC ${fn}`,
       timeoutMs: DEFAULTS.statementTimeoutMs,
     });
-    return response.json<T>();
+    return response.text();
   }
 
   async query<T extends SqlRow = SqlRow>(sql: string, params: readonly unknown[] = []): Promise<SqlResult<T>> {
-    const rows = await this.call<unknown>(EXEC_SQL_FUNCTION, { query: inlineParams(sql, params) });
-    if (!Array.isArray(rows)) return { rows: [], rowCount: 0 };
-    return { rows: rows as readonly T[], rowCount: rows.length };
+    const text = await this.call(EXEC_SQL_FUNCTION, { query: inlineParams(sql, params) });
+    if (text.trim() === '') return { rows: [], rowCount: 0 };
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new MigrationError('SQL_ERROR', 'The SQL helper returned a response that was not valid JSON', {
+        detail: text.slice(0, 400),
+      });
+    }
+
+    if (!Array.isArray(parsed)) return { rows: [], rowCount: 0 };
+    return { rows: parsed as readonly T[], rowCount: parsed.length };
   }
 
   async execute(sql: string, params: readonly unknown[] = []): Promise<void> {
-    await this.call<null>(`${EXEC_SQL_FUNCTION}_ddl`, { query: inlineParams(sql, params) });
+    // The response body is deliberately ignored — see `call`. A `void` function yields
+    // 204/empty, and there is nothing to parse.
+    await this.call(`${EXEC_SQL_FUNCTION}_ddl`, { query: inlineParams(sql, params) });
   }
 
   async dispose(): Promise<void> {
@@ -268,6 +294,11 @@ export function buildPostgresConfig(creds: SupabaseCredentials): ClientConfig | 
   const connection = creds.database;
 
   if (connection !== undefined) {
+    // RPC mode deliberately has no socket. Returning null here is what makes the
+    // direct-Postgres transport report itself unavailable, so the factory falls through
+    // to the RPC transport — which is the whole point of the mode.
+    if (connection.mode === 'rpc') return null;
+
     const resolved = resolveConnection(connection);
     if (resolved === null) return null;
 
@@ -338,51 +369,10 @@ export function buildPostgresConfig(creds: SupabaseCredentials): ClientConfig | 
 // Bootstrap SQL for the RPC transport
 // ---------------------------------------------------------------------------
 
-/**
- * SQL that installs the two helper functions the RPC transport needs.
- *
- * Shown verbatim in the UI so a user whose self-hosted instance has no reachable
- * Postgres port can paste it into their SQL editor and unlock the RPC transport.
- */
-export const EXEC_HELPER_SQL = `
--- Nebkern Migration Tool: SQL execution helpers.
--- These grant full database access to any caller, so they are restricted to the
--- service_role and should be dropped once your migration finishes.
-
-create or replace function public.${EXEC_SQL_FUNCTION}(query text)
-returns jsonb
-language plpgsql
-security definer
-as $nebkern$
-declare
-  result jsonb;
-begin
-  execute format('select coalesce(jsonb_agg(t), ''[]''::jsonb) from (%s) t', query) into result;
-  return result;
-end;
-$nebkern$;
-
-create or replace function public.${EXEC_SQL_FUNCTION}_ddl(query text)
-returns void
-language plpgsql
-security definer
-as $nebkern$
-begin
-  execute query;
-end;
-$nebkern$;
-
-revoke all on function public.${EXEC_SQL_FUNCTION}(text) from public, anon, authenticated;
-revoke all on function public.${EXEC_SQL_FUNCTION}_ddl(text) from public, anon, authenticated;
-grant execute on function public.${EXEC_SQL_FUNCTION}(text) to service_role;
-grant execute on function public.${EXEC_SQL_FUNCTION}_ddl(text) to service_role;
-`.trim();
-
-/** Removes the helpers. Offered as a post-migration cleanup action. */
-export const DROP_EXEC_HELPER_SQL = `
-drop function if exists public.${EXEC_SQL_FUNCTION}(text);
-drop function if exists public.${EXEC_SQL_FUNCTION}_ddl(text);
-`.trim();
+// The SQL itself lives in `exec-helper.ts`, which imports nothing from `pg`, so the
+// setup UI can display it without dragging a Postgres driver into the browser bundle.
+// Re-exported here so server-side callers keep a single import site.
+export { EXEC_HELPER_SQL, DROP_EXEC_HELPER_SQL } from '@/core/transport/exec-helper';
 
 export async function installExecHelpers(transport: SqlTransport): Promise<void> {
   await transport.execute(EXEC_HELPER_SQL);

@@ -15,7 +15,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { credentialsSchema, errorResponse, toCredentials } from '@/core/api/schemas';
-import { testDatabase } from '@/core/services/diagnostics.service';
+import { testDatabase, testRpc } from '@/core/services/diagnostics.service';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -28,8 +28,15 @@ export async function POST(request: Request): Promise<NextResponse> {
   try {
     const body: unknown = await request.json();
     const { credentials } = bodySchema.parse(body);
+    const creds = toCredentials(credentials);
 
-    return NextResponse.json(await testDatabase(toCredentials(credentials)));
+    // Both channels answer the same question — "can we run SQL here, and with what
+    // privileges" — and return the same shape, so the UI renders one result panel
+    // regardless of which pipe carried it.
+    const result =
+      creds.database?.mode === 'rpc' ? await testRpc(creds) : await testDatabase(creds);
+
+    return NextResponse.json(result);
   } catch (err) {
     // Only a malformed request reaches this. A failed *connection* is a successful
     // response carrying a diagnostic.

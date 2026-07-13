@@ -28,7 +28,7 @@ import { toMigrationError } from '@/core/domain/errors';
 import { httpRequest, normaliseUrl, parseProjectRef, serviceHeaders } from '@/core/transport/http';
 import { inspectKey } from '@/core/transport/jwt';
 import { detectPooler, resolveConnection } from '@/core/transport/postgres-url';
-import { buildPostgresConfig } from '@/core/transport/transports';
+import { buildPostgresConfig, RpcTransport } from '@/core/transport/transports';
 
 // ---------------------------------------------------------------------------
 // API test — steps 1 to 4
@@ -170,6 +170,147 @@ const PERMISSION_SQL = `
     ) as supabase_admin
 `;
 
+/**
+ * Turns the raw privilege flags into the list the UI shows.
+ *
+ * Shared by both SQL channels — a direct socket and the RPC helper reach the same
+ * server and must report the same answer, so this must not be duplicated.
+ */
+function buildPermissions(perms: Record<string, boolean | null>): DatabasePermission[] {
+  const superuser = perms.superuser === true;
+  const supabaseAdmin = perms.supabase_admin === true;
+
+  return [
+    {
+      key: 'create_schema',
+      label: 'Create schemas',
+      granted: perms.create_schema === true,
+      required: 'Needed to recreate custom schemas. Without it, only existing schemas can be migrated into.',
+    },
+    {
+      key: 'create_table',
+      label: 'Create tables',
+      granted: perms.create_table === true,
+      required: 'Needed for every table, view, function and policy. A migration cannot proceed without it.',
+    },
+    {
+      key: 'create_extension',
+      label: 'Install extensions',
+      granted: superuser || supabaseAdmin || perms.createdb === true,
+      required: 'Needed for the Extensions stage. Deselect it in Step 3 if your destination already has them.',
+    },
+    {
+      key: 'replication',
+      label: 'Manage publications',
+      granted: superuser || supabaseAdmin || perms.replication === true,
+      required: 'Needed to enable Realtime on the destination. Other stages are unaffected.',
+    },
+    {
+      key: 'superuser',
+      label: 'Superuser',
+      granted: superuser,
+      required: 'Not required. Shown for reference — a non-superuser with the grants above can migrate fine.',
+    },
+  ];
+}
+
+/**
+ * Tests the SQL helper (RPC) channel — SQL over the Supabase API, no database port.
+ *
+ * Reports the same shape as {@link testDatabase} because, from the migration's point of
+ * view, it *is* the same thing: a way to run SQL against the destination. The user
+ * should not have to care which pipe carried it.
+ *
+ * The failure this must handle gracefully is "the helper isn't installed yet", which is
+ * the expected state on a first run rather than an error. PostgREST answers a missing
+ * RPC with a 404, so that is turned into an instruction, not a stack trace.
+ */
+export async function testRpc(creds: SupabaseCredentials): Promise<DatabaseTestResult> {
+  const started = Date.now();
+  const transport = new RpcTransport(normaliseUrl(creds.url), creds.serviceRoleKey);
+
+  const fail = (error: string, errorCode: string | null, hints: string[]): DatabaseTestResult => ({
+    ok: false,
+    version: null,
+    versionFull: null,
+    database: null,
+    user: null,
+    permissions: [],
+    extensions: [],
+    resolved: null,
+    pooler: null,
+    error,
+    errorCode,
+    hints,
+    latencyMs: Date.now() - started,
+  });
+
+  try {
+    const [identity, permissionRows, extensionRows] = await Promise.all([
+      transport.query<{ version: string; db: string; usr: string }>(
+        'select version() as version, current_database() as db, current_user as usr',
+      ),
+      transport.query<Record<string, boolean | null>>(PERMISSION_SQL),
+      transport.query<{ name: string; version: string }>(
+        'select extname as name, extversion as version from pg_extension order by extname',
+      ),
+    ]);
+
+    const row = identity.rows[0];
+    const versionFull = String(row?.version ?? '');
+    const permissions = buildPermissions(permissionRows.rows[0] ?? {});
+
+    const hints: string[] = [];
+    if (!permissions[1]!.granted) {
+      hints.push(
+        `The helper runs as "${String(row?.usr ?? 'unknown')}", which cannot create tables in the public schema.`,
+      );
+    }
+    hints.push(
+      'Remember to drop the helper functions once your migration is finished — the Settings page has the SQL.',
+    );
+
+    return {
+      ok: true,
+      version: shortVersion(versionFull),
+      versionFull,
+      database: row?.db === undefined ? null : String(row.db),
+      user: row?.usr === undefined ? null : String(row.usr),
+      permissions,
+      extensions: extensionRows.rows.map((r) => ({ name: String(r.name), version: String(r.version) })),
+      resolved: null,
+      pooler: null,
+      error: null,
+      errorCode: null,
+      hints,
+      latencyMs: Date.now() - started,
+    };
+  } catch (err) {
+    const error = toMigrationError(err);
+
+    // Not installed yet — the expected state on a first run, so it gets instructions
+    // rather than an error stack.
+    if (error.code === 'NOT_FOUND') {
+      return fail('The SQL helper function is not installed on this project yet.', 'HELPER_NOT_INSTALLED', [
+        'Copy the SQL shown above and run it in your Supabase SQL editor (Studio → SQL Editor), then test again.',
+        'It creates two functions restricted to the service_role, and needs no database port to be exposed.',
+      ]);
+    }
+
+    if (error.code === 'AUTH_FAILED') {
+      return fail('The API rejected the service role key.', 'AUTH_FAILED', [
+        'The SQL helper is only granted to the service_role. Confirm the key above is the service role key, not the anon key.',
+      ]);
+    }
+
+    return fail(error.message, error.code, [
+      'The helper function exists but the call failed. Check that it was created exactly as shown, in the public schema.',
+    ]);
+  } finally {
+    await transport.dispose();
+  }
+}
+
 export async function testDatabase(creds: SupabaseCredentials): Promise<DatabaseTestResult> {
   const started = Date.now();
 
@@ -214,43 +355,7 @@ export async function testDatabase(creds: SupabaseCredentials): Promise<Database
     ]);
 
     const versionFull = versionRow.rows[0]?.version ?? '';
-    const perms = permissionRow.rows[0] ?? {};
-
-    const superuser = perms.superuser === true;
-    const supabaseAdmin = perms.supabase_admin === true;
-
-    const permissions: DatabasePermission[] = [
-      {
-        key: 'create_schema',
-        label: 'Create schemas',
-        granted: perms.create_schema === true,
-        required: 'Needed to recreate custom schemas. Without it, only existing schemas can be migrated into.',
-      },
-      {
-        key: 'create_table',
-        label: 'Create tables',
-        granted: perms.create_table === true,
-        required: 'Needed for every table, view, function and policy. A migration cannot proceed without it.',
-      },
-      {
-        key: 'create_extension',
-        label: 'Install extensions',
-        granted: superuser || supabaseAdmin || perms.createdb === true,
-        required: 'Needed for the Extensions stage. Deselect it in Step 3 if your destination already has them.',
-      },
-      {
-        key: 'replication',
-        label: 'Manage publications',
-        granted: superuser || supabaseAdmin || perms.replication === true,
-        required: 'Needed to enable Realtime on the destination. Other stages are unaffected.',
-      },
-      {
-        key: 'superuser',
-        label: 'Superuser',
-        granted: superuser,
-        required: 'Not required. Shown for reference — a non-superuser with the grants above can migrate fine.',
-      },
-    ];
+    const permissions = buildPermissions(permissionRow.rows[0] ?? {});
 
     const hints: string[] = [];
     if (!permissions[1]!.granted) {
