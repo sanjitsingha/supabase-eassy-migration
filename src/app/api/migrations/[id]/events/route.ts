@@ -15,8 +15,24 @@ import { migrationRuntime } from '@/core/services/orchestrator';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-/** Long-lived connection: it must not be cut short by a function timeout. */
-export const maxDuration = 3600;
+/**
+ * Long-lived connection: on a persistent host it stays open for the life of the
+ * migration, kept alive by the 15s comment ping below and reopened automatically by
+ * `EventSource` if a proxy or load balancer cuts it. 300 is the ceiling Vercel's
+ * platform accepts on any plan (Hobby caps here; paid plans allow more but this route
+ * does not depend on staying inside one invocation, so there is no reason to ask for
+ * more than the safe universal maximum).
+ *
+ * This value is irrelevant on a persistent Node process (Docker, a VPS, Railway,
+ * Fly.io) — `next start` is not subject to a per-request timeout at all. It only
+ * matters if this route is deployed onto a serverless platform, and even then it only
+ * fixes the build: serverless functions are frozen once the response is considered
+ * "done," which for a stream means the connection drops well before 300s regardless of
+ * this number. This app's execution model — a background migration runner living in
+ * process memory, an in-memory credential vault, a local file-backed job store — needs
+ * a long-running process. See the README's Deployment section.
+ */
+export const maxDuration = 300;
 
 interface RouteContext {
   readonly params: Promise<{ readonly id: string }>;
