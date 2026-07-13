@@ -118,6 +118,14 @@ Nebkern is a **long-running process**, not a request/response API. A migration k
 
 If you saw a `maxDuration` build error on Vercel, that error is now fixed — every route is capped at 300s, the platform ceiling. But fixing it does not make migrations survive on serverless: the underlying execution model still needs a process that keeps running. Deploy to one of the ✅ targets above instead.
 
+### If you're seeing `ENOENT: mkdir '.nebkern'` (e.g. on Vercel)
+
+Vercel's deployed function bundle (`/var/task`) is read-only, so writing `.nebkern/` next to the code fails. The store now detects an unwritable root and falls back to the OS temp directory automatically — this specific crash is fixed, on Vercel and any similarly read-only host.
+
+That fallback keeps the app answering requests; it does not make it durable there. `os.tmpdir()` on a serverless platform is wiped between invocations and isn't shared across concurrent instances, so job history and resumability still won't survive — the deeper incompatibility above is unchanged. If you're seeing the fallback engage, treat it as confirmation you're on a platform this app isn't designed to run migrations on, not as a green light.
+
+Set `NEBKERN_DATA_DIR` to an explicit writable path (e.g. a mounted persistent volume) to skip the guesswork on any host.
+
 ## ⚠️ Known Limitations
 
 - Edge Functions auto-deployment is Cloud-only

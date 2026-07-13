@@ -21,32 +21,72 @@
 
 import { mkdir, readFile, writeFile, rename, readdir, unlink, appendFile, stat, open } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import type { LogEntry, LogLevel, MigrationJob, StageId } from '@/core/domain/types';
 import { DATA_DIR } from '@/core/domain/constants';
 
-// The literal is spelled out rather than interpolated so the bundler can see the
-// path is statically scoped to a fixed subfolder of the project — a computed
-// `join(cwd(), someVar)` makes it (reasonably) warn that it cannot trace the target.
-const ROOT = join(process.cwd(), '.nebkern');
-const JOBS_DIR = join(ROOT, 'jobs');
-const LOGS_DIR = join(ROOT, 'logs');
-
 // Keep the constant honest: it is the documented name of the directory, and a
-// mismatch between it and the literal above would be a silent bug.
+// mismatch between it and the candidates built from it below would be a silent bug.
 if (DATA_DIR !== '.nebkern') {
-  throw new Error(`DATA_DIR constant (${DATA_DIR}) no longer matches the store's literal path`);
+  throw new Error(`DATA_DIR constant (${DATA_DIR}) no longer matches the store's directory name`);
 }
 
-let initialised: Promise<void> | null = null;
+interface Dirs {
+  readonly root: string;
+  readonly jobs: string;
+  readonly logs: string;
+}
 
-/** Creates the data directories once per process. */
-function ensureDirs(): Promise<void> {
-  initialised ??= (async () => {
-    await mkdir(JOBS_DIR, { recursive: true });
-    await mkdir(LOGS_DIR, { recursive: true });
+let dirsPromise: Promise<Dirs> | null = null;
+
+/**
+ * Resolves and creates the data directory, tolerating a read-only deployment root.
+ *
+ * `process.cwd()/.nebkern` is the right answer everywhere this app is meant to run —
+ * a VPS, a Docker container, Railway, Fly.io — where the directory persists across
+ * restarts, which is exactly what makes a migration resumable. See the README's
+ * Deployment section.
+ *
+ * On a serverless platform (Vercel functions, AWS Lambda) the deployed bundle is
+ * mounted read-only, so `mkdir` there fails. Rather than crash every single request
+ * before it reaches any real work, we fall back to the OS temp directory, which every
+ * Node runtime — including a serverless one — guarantees is writable.
+ *
+ * That fallback keeps the app answering requests; it does not make it durable there.
+ * `os.tmpdir()` on a serverless platform is ephemeral per invocation and is not shared
+ * across concurrent instances, so job history and resumability do not survive on that
+ * path. If you are seeing this fallback engage, you are on a platform this app is not
+ * designed to run background migrations on — deploy to one of the targets above
+ * instead. `NEBKERN_DATA_DIR` is available as an explicit override, for anyone who
+ * wants to point this at a mounted persistent volume rather than rely on the guess.
+ */
+async function resolveDirs(): Promise<Dirs> {
+  dirsPromise ??= (async () => {
+    const override = process.env.NEBKERN_DATA_DIR;
+    const candidates = override !== undefined && override !== '' ? [override] : [join(process.cwd(), '.nebkern')];
+
+    for (const root of candidates) {
+      const jobs = join(root, 'jobs');
+      const logs = join(root, 'logs');
+      try {
+        await mkdir(jobs, { recursive: true });
+        await mkdir(logs, { recursive: true });
+        return { root, jobs, logs };
+      } catch {
+        // Read-only filesystem — most likely a serverless deployment. Fall through to
+        // the guaranteed-writable location below rather than raising here.
+      }
+    }
+
+    const root = join(tmpdir(), 'nebkern');
+    const jobs = join(root, 'jobs');
+    const logs = join(root, 'logs');
+    await mkdir(jobs, { recursive: true });
+    await mkdir(logs, { recursive: true });
+    return { root, jobs, logs };
   })();
-  return initialised;
+  return dirsPromise;
 }
 
 /**
@@ -95,16 +135,16 @@ export interface JobRepository {
 
 export const jobRepository: JobRepository = {
   async save(job: MigrationJob): Promise<void> {
-    await ensureDirs();
-    await enqueue(job.id, () => atomicWrite(join(JOBS_DIR, `${job.id}.json`), JSON.stringify(job, null, 2)));
+    const { jobs } = await resolveDirs();
+    await enqueue(job.id, () => atomicWrite(join(jobs, `${job.id}.json`), JSON.stringify(job, null, 2)));
   },
 
   async find(id: string): Promise<MigrationJob | null> {
-    await ensureDirs();
+    const { jobs } = await resolveDirs();
     // Guard against path traversal via a crafted id in the route param.
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) return null;
     try {
-      const raw = await readFile(join(JOBS_DIR, `${id}.json`), 'utf8');
+      const raw = await readFile(join(jobs, `${id}.json`), 'utf8');
       return JSON.parse(raw) as MigrationJob;
     } catch {
       return null;
@@ -112,14 +152,14 @@ export const jobRepository: JobRepository = {
   },
 
   async list(): Promise<readonly MigrationJob[]> {
-    await ensureDirs();
-    const files = await readdir(JOBS_DIR).catch(() => [] as string[]);
+    const { jobs: jobsDir } = await resolveDirs();
+    const files = await readdir(jobsDir).catch(() => [] as string[]);
     const jobs: MigrationJob[] = [];
 
     for (const file of files) {
       if (!file.endsWith('.json')) continue;
       try {
-        jobs.push(JSON.parse(await readFile(join(JOBS_DIR, file), 'utf8')) as MigrationJob);
+        jobs.push(JSON.parse(await readFile(join(jobsDir, file), 'utf8')) as MigrationJob);
       } catch {
         // A torn file from a hard kill: skip rather than failing the whole listing.
       }
@@ -129,10 +169,10 @@ export const jobRepository: JobRepository = {
   },
 
   async remove(id: string): Promise<void> {
-    await ensureDirs();
+    const { jobs, logs } = await resolveDirs();
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) return;
-    await unlink(join(JOBS_DIR, `${id}.json`)).catch(() => undefined);
-    await unlink(join(LOGS_DIR, `${id}.ndjson`)).catch(() => undefined);
+    await unlink(join(jobs, `${id}.json`)).catch(() => undefined);
+    await unlink(join(logs, `${id}.ndjson`)).catch(() => undefined);
   },
 };
 
@@ -157,8 +197,8 @@ export interface LogRepository {
   queryAll(query?: LogQuery): Promise<{ entries: readonly LogEntry[]; total: number }>;
 }
 
-function logPath(jobId: string): string {
-  return join(LOGS_DIR, `${jobId}.ndjson`);
+function logPath(logsDir: string, jobId: string): string {
+  return join(logsDir, `${jobId}.ndjson`);
 }
 
 /** Parses NDJSON, tolerating a torn final line from an unclean shutdown. */
@@ -188,17 +228,17 @@ function matches(entry: LogEntry, query: LogQuery): boolean {
 
 export const logRepository: LogRepository = {
   async append(entry: LogEntry): Promise<void> {
-    await ensureDirs();
+    const { logs } = await resolveDirs();
     // Appends of a single line under the pipe-buffer size are effectively atomic,
     // so unlike job docs these don't need the temp+rename dance.
-    await appendFile(logPath(entry.jobId), `${JSON.stringify(entry)}\n`, 'utf8');
+    await appendFile(logPath(logs, entry.jobId), `${JSON.stringify(entry)}\n`, 'utf8');
   },
 
   async query(jobId: string, query: LogQuery = {}): Promise<{ entries: readonly LogEntry[]; total: number }> {
-    await ensureDirs();
+    const { logs } = await resolveDirs();
     if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return { entries: [], total: 0 };
 
-    const raw = await readFile(logPath(jobId), 'utf8').catch(() => '');
+    const raw = await readFile(logPath(logs, jobId), 'utf8').catch(() => '');
     const all = parseNdjson(raw).filter((e) => matches(e, query));
     const offset = query.offset ?? 0;
     const limit = query.limit ?? 500;
@@ -207,19 +247,19 @@ export const logRepository: LogRepository = {
   },
 
   async raw(jobId: string): Promise<string> {
-    await ensureDirs();
+    const { logs } = await resolveDirs();
     if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return '';
-    return readFile(logPath(jobId), 'utf8').catch(() => '');
+    return readFile(logPath(logs, jobId), 'utf8').catch(() => '');
   },
 
   async queryAll(query: LogQuery = {}): Promise<{ entries: readonly LogEntry[]; total: number }> {
-    await ensureDirs();
-    const files = await readdir(LOGS_DIR).catch(() => [] as string[]);
+    const { logs } = await resolveDirs();
+    const files = await readdir(logs).catch(() => [] as string[]);
     const all: LogEntry[] = [];
 
     for (const file of files) {
       if (!file.endsWith('.ndjson')) continue;
-      const raw = await readFile(join(LOGS_DIR, file), 'utf8').catch(() => '');
+      const raw = await readFile(join(logs, file), 'utf8').catch(() => '');
       all.push(...parseNdjson(raw).filter((e) => matches(e, query)));
     }
 
@@ -233,15 +273,15 @@ export const logRepository: LogRepository = {
 
 /** Total bytes used by the local job/log store — shown on the Settings page. */
 export async function storeFootprint(): Promise<{ jobs: number; logs: number; bytes: number }> {
-  await ensureDirs();
+  const { jobs, logs } = await resolveDirs();
   let bytes = 0;
 
-  const jobFiles = await readdir(JOBS_DIR).catch(() => [] as string[]);
-  const logFiles = await readdir(LOGS_DIR).catch(() => [] as string[]);
+  const jobFiles = await readdir(jobs).catch(() => [] as string[]);
+  const logFiles = await readdir(logs).catch(() => [] as string[]);
 
   for (const [dir, files] of [
-    [JOBS_DIR, jobFiles],
-    [LOGS_DIR, logFiles],
+    [jobs, jobFiles],
+    [logs, logFiles],
   ] as const) {
     for (const file of files) {
       const info = await stat(join(dir, file)).catch(() => null);
@@ -254,8 +294,8 @@ export async function storeFootprint(): Promise<{ jobs: number; logs: number; by
 
 /** Ensures the data dir exists and returns its absolute path. */
 export async function dataDirectory(): Promise<string> {
-  await ensureDirs();
-  return ROOT;
+  const { root } = await resolveDirs();
+  return root;
 }
 
 /** Convenience used across services — a short, URL-safe, sortable id. */
